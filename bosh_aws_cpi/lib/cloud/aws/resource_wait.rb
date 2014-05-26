@@ -92,7 +92,7 @@ module Bosh::AwsCloud
     def self.for_snapshot(args)
       snapshot = args.fetch(:snapshot) { raise ArgumentError, 'snapshot object required' }
       target_state = args.fetch(:state) { raise ArgumentError, 'state symbol required' }
-      valid_states = [:completed]
+      valid_states = [:completed, :pending]
       validate_states(valid_states, target_state)
 
       new.for_resource(resource: snapshot, target_state: target_state, tries: 18) do |current_state|
