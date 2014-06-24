@@ -1,6 +1,6 @@
 require 'spec_helper'
 
-describe 'Ubuntu 14.04 OS image' do
+describe 'Ubuntu 14.04 OS image', os_image: true do
   it_behaves_like 'an OS image'
 
   describe package('apt') do
@@ -142,9 +142,9 @@ describe 'Ubuntu 14.04 OS image' do
 
   context 'installed by system_kernel' do
     %w(
-      linux-headers-virtual
-      linux-image-virtual
-      linux-image-extra-virtual
+      linux-generic
+      linux-image-generic
+      linux-headers-generic
     ).each do |pkg|
       describe package(pkg) do
         it { should be_installed }

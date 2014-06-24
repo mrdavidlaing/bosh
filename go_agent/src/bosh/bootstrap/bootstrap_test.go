@@ -65,13 +65,15 @@ func init() {
 			})
 
 			It("returns the settings service", func() {
-				settingsService, err := bootstrap()
+				result, err := bootstrap()
 				Expect(err).NotTo(HaveOccurred())
-				Expect(settingsService).To(Equal(settingsService))
+				Expect(result).To(Equal(settingsService))
 
 				Expect(settingsServiceProvider.NewServiceFs).To(Equal(platform.GetFs()))
 				Expect(settingsServiceProvider.NewServiceDir).To(Equal(dirProvider.BoshDir()))
+				Expect(settingsServiceProvider.NewDefaultNetworkResolver).To(Equal(platform))
 
+				// cannot compare NewServiceFetcher so call it to see that it returns inf settings
 				fetchedSettings, err := settingsServiceProvider.NewServiceFetcher()
 				Expect(err).NotTo(HaveOccurred())
 				Expect(fetchedSettings).To(Equal(inf.Settings))
@@ -103,7 +105,7 @@ func init() {
 			})
 
 			It("sets up ephemeral disk", func() {
-				settingsService.Disks = boshsettings.Disks{
+				settingsService.Settings.Disks = boshsettings.Disks{
 					Ephemeral: "fake-ephemeral-disk-setting",
 				}
 
@@ -150,7 +152,7 @@ func init() {
 			})
 
 			It("mounts persistent disk", func() {
-				settingsService.Disks = boshsettings.Disks{
+				settingsService.Settings.Disks = boshsettings.Disks{
 					Persistent: map[string]string{"vol-123": "/dev/sdb"},
 				}
 
@@ -161,7 +163,7 @@ func init() {
 			})
 
 			It("errors if there is more than one persistent disk", func() {
-				settingsService.Disks = boshsettings.Disks{
+				settingsService.Settings.Disks = boshsettings.Disks{
 					Persistent: map[string]string{
 						"vol-123": "/dev/sdb",
 						"vol-456": "/dev/sdc",
@@ -173,7 +175,7 @@ func init() {
 			})
 
 			It("does not try to mount when no persistent disk", func() {
-				settingsService.Disks = boshsettings.Disks{
+				settingsService.Settings.Disks = boshsettings.Disks{
 					Persistent: map[string]string{},
 				}
 

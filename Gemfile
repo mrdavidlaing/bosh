@@ -35,11 +35,6 @@ group :production do
   gem 'mysql2'
 end
 
-group :development do
-  gem 'ruby_gntp'
-  gem 'git-duet', require: false
-end
-
 group :bat do
   gem 'httpclient'
   gem 'json'
@@ -51,18 +46,18 @@ group :development, :test do
   gemspec path: 'bosh-dev'
   gemspec path: 'bosh-stemcell'
 
-  gem 'rspec', '3.0.0.beta1'
+  gem 'rspec', '~> 3.0'
   gem 'rspec-its'
-  gem 'rspec-instafail'
 
   gem 'rubocop', require: false
   gem 'parallel_tests'
   gem 'rack-test'
   gem 'ci_reporter'
   gem 'webmock'
-  gem 'fakefs'
-  gem 'simplecov'
-  gem 'simplecov-rcov'
+  gem 'fakefs', git: 'https://github.com/pivotal-cf-experimental/fakefs.git', ref: 'ebde3d6c'
+  # simplecov 0.8.x has an exit code bug: https://github.com/colszowka/simplecov/issues/281
+  gem 'simplecov', '~> 0.7.1'
+  gem 'codeclimate-test-reporter', require: false
   gem 'vcr'
 
   # Explicitly do not require serverspec dependency

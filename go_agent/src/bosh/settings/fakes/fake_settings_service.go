@@ -10,6 +10,7 @@ type FakeSettingsServiceProvider struct {
 	NewServiceFs              boshsys.FileSystem
 	NewServiceDir             string
 	NewServiceFetcher         boshsettings.SettingsFetcher
+	NewDefaultNetworkResolver boshsettings.DefaultNetworkDelegate
 	NewServiceSettingsService *FakeSettingsService
 }
 
@@ -23,11 +24,13 @@ func (provider *FakeSettingsServiceProvider) NewService(
 	fs boshsys.FileSystem,
 	dir string,
 	fetcher boshsettings.SettingsFetcher,
+	defaultNetworkResolver boshsettings.DefaultNetworkDelegate,
 	logger boshlog.Logger,
 ) boshsettings.Service {
 	provider.NewServiceFs = fs
 	provider.NewServiceDir = dir
 	provider.NewServiceFetcher = fetcher
+	provider.NewDefaultNetworkResolver = defaultNetworkResolver
 	return provider.NewServiceSettingsService
 }
 
@@ -39,14 +42,6 @@ type FakeSettingsService struct {
 	SettingsWereInvalidated bool
 
 	Settings boshsettings.Settings
-
-	Blobstore boshsettings.Blobstore
-	AgentID   string
-	VM        boshsettings.VM
-	MbusURL   string
-	Disks     boshsettings.Disks
-	DefaultIP string
-	IPs       []string
 }
 
 func (service *FakeSettingsService) InvalidateSettings() error {
@@ -61,32 +56,4 @@ func (service *FakeSettingsService) LoadSettings() error {
 
 func (service FakeSettingsService) GetSettings() boshsettings.Settings {
 	return service.Settings
-}
-
-func (service FakeSettingsService) GetBlobstore() boshsettings.Blobstore {
-	return service.Blobstore
-}
-
-func (service FakeSettingsService) GetAgentID() string {
-	return service.AgentID
-}
-
-func (service FakeSettingsService) GetVM() boshsettings.VM {
-	return service.VM
-}
-
-func (service FakeSettingsService) GetMbusURL() string {
-	return service.MbusURL
-}
-
-func (service FakeSettingsService) GetDisks() boshsettings.Disks {
-	return service.Disks
-}
-
-func (service FakeSettingsService) GetDefaultIP() (string, bool) {
-	return service.DefaultIP, service.DefaultIP != ""
-}
-
-func (service FakeSettingsService) GetIPs() []string {
-	return service.IPs
 }

@@ -95,9 +95,9 @@ func (app *app) Setup(args []string) error {
 		return bosherr.WrapError(err, "Getting mbus handler")
 	}
 
-	blobstoreProvider := boshblob.NewProvider(app.platform, dirProvider)
+	blobstoreProvider := boshblob.NewProvider(app.platform, dirProvider, app.logger)
 
-	blobstore, err := blobstoreProvider.Get(settingsService.GetBlobstore())
+	blobstore, err := blobstoreProvider.Get(settingsService.GetSettings().Blobstore)
 	if err != nil {
 		return bosherr.WrapError(err, "Getting blobstore")
 	}
@@ -141,7 +141,6 @@ func (app *app) Setup(args []string) error {
 	specFilePath := filepath.Join(dirProvider.BoshDir(), "spec.json")
 	specService := boshas.NewConcreteV1Service(
 		app.platform.GetFs(),
-		app.platform,
 		specFilePath,
 	)
 

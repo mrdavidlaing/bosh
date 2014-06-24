@@ -200,7 +200,13 @@ module Bosh::Cli
         director.list_releases.inject({}) do |hash, release|
           name = release['name']
           versions = release['versions'] || release['release_versions'].map { |release_version| release_version['version'] }
-          latest_version = versions.map { |v| Bosh::Common::VersionNumber.new(v) }.max
+          parsed_versions = versions.map do |version|
+            {
+              original: version,
+              parsed: Bosh::Common::Version::ReleaseVersion.parse(version)
+            }
+          end
+          latest_version = parsed_versions.sort_by {|v| v[:parsed] }.last[:original]
           hash[name] = latest_version.to_s
           hash
         end
@@ -368,7 +374,7 @@ module Bosh::Cli
         end
 
         stemcells.inject({}) do |hash, (name, versions)|
-          hash[name] = versions.map { |v| Bosh::Common::VersionNumber.new(v) }.max.to_s
+          hash[name] = Bosh::Common::Version::StemcellVersion.parse_list(versions).latest.to_s
           hash
         end
       end

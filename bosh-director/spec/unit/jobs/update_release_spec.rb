@@ -21,20 +21,27 @@ module Bosh::Director
     end
 
     describe 'updating a release' do
+      let(:job) { Jobs::UpdateRelease.new(release_dir, job_options) }
+      let(:job_options) { {} }
+      let(:release_dir) { Test::ReleaseHelper.new.create_release_tarball(manifest) }
       let(:manifest) do
         {
           'name' => 'appcloud',
-          'version' => '42.6-dev',
+          'version' => release_version,
           'commit_hash' => '12345678',
           'uncommitted_changes' => 'true',
-          'jobs' => [],
-          'packages' => []
+          'jobs' => manifest_jobs,
+          'packages' => manifest_packages
         }
       end
+      let(:release_version) { '42+dev.6' }
+      let(:release) { Models::Release.make(name: 'appcloud') }
+      let(:manifest_packages) { [] }
+      let(:manifest_jobs) { [] }
+      before { allow(job).to receive(:with_release_lock).and_yield }
 
       context 'processing update release' do
         it 'with a local release' do
-          job = Jobs::UpdateRelease.new(@release_dir)
           job.should_not_receive(:download_remote_release)
           job.should_receive(:extract_release)
           job.should_receive(:verify_manifest)
@@ -43,46 +50,54 @@ module Bosh::Director
           job.perform
         end
 
-        it 'with a remote release' do
-          job = Jobs::UpdateRelease.new(@release_dir, {'remote' => true, 'location' => 'release_location'})
-          job.should_receive(:download_remote_release)
-          job.should_receive(:extract_release)
-          job.should_receive(:verify_manifest)
-          job.should_receive(:process_release)
+        context 'when release is remote' do
+          let(:job_options) { {'remote' => true, 'location' => 'release_location'} }
 
-          job.perform
+          it 'with a remote release' do
+            job.should_receive(:download_remote_release)
+            job.should_receive(:extract_release)
+            job.should_receive(:verify_manifest)
+            job.should_receive(:process_release)
+
+            job.perform
+          end
         end
       end
 
       context 'commit_hash and uncommitted changes flag' do
         it 'sets commit_hash and uncommitted changes flag on release_version' do
-          release_dir = Test::ReleaseHelper.new.create_release_tarball(manifest)
-          job = Jobs::UpdateRelease.new(release_dir)
           job.extract_release
           job.verify_manifest
           job.process_release
 
-          rv = Models::ReleaseVersion.filter(version: '42.6-dev').first
+          rv = Models::ReleaseVersion.filter(version: '42+dev.6').first
 
           rv.should_not be_nil
           rv.commit_hash.should == '12345678'
           rv.uncommitted_changes.should be(true)
         end
 
-        it 'sets default commit_hash and uncommitted_changes flag if missing' do
-          manifest.delete('commit_hash')
-          manifest.delete('uncommitted_changes')
-          release_dir = Test::ReleaseHelper.new.create_release_tarball(manifest)
-          job = Jobs::UpdateRelease.new(release_dir)
-          job.extract_release
-          job.verify_manifest
-          job.process_release
+        context 'when commit_hash and uncommitted_changes flag are missing' do
+          let(:manifest) do
+            {
+              'name' => 'appcloud',
+              'version' => '42.6-dev',
+              'jobs' => [],
+              'packages' => []
+            }
+          end
 
-          rv = Models::ReleaseVersion.filter(version: '42.6-dev').first
+          it 'sets default commit_hash and uncommitted changes' do
+            job.extract_release
+            job.verify_manifest
+            job.process_release
 
-          rv.should_not be_nil
-          rv.commit_hash.should == 'unknown'
-          rv.uncommitted_changes.should be(false)
+            rv = Models::ReleaseVersion.filter(version: '42+dev.6').first
+
+            rv.should_not be_nil
+            rv.commit_hash.should == 'unknown'
+            rv.uncommitted_changes.should be(false)
+          end
         end
       end
 
@@ -91,19 +106,194 @@ module Bosh::Director
           result = Bosh::Exec::Result.new('cmd', 'output', 1)
           Bosh::Exec.should_receive(:sh).and_return(result)
 
-          release_dir = Test::ReleaseHelper.new.create_release_tarball(manifest)
-          job = Jobs::UpdateRelease.new(release_dir)
-
           expect {
             job.extract_release
           }.to raise_exception(Bosh::Director::ReleaseInvalidArchive)
         end
       end
+
+      describe 'processing release' do
+        context 'release already exists' do
+          before do
+            Models::ReleaseVersion.make(release: release, version: '42+dev.6')
+          end
+
+          it 'raises an error ReleaseAlreadyExists' do
+            expect {
+              job.perform
+            }.to raise_error(
+              ReleaseAlreadyExists,
+              %Q{Release `appcloud/42+dev.6' already exists}
+            )
+          end
+
+          context 'when the rebase is passed' do
+            let(:job_options) { { 'rebase' => true } }
+            context 'when there are package changes' do
+              let(:manifest_packages) do
+                [
+                  {
+                    'sha1' => 'fake-sha-1',
+                    'fingerprint' => 'fake-fingerprint-1',
+                    'name' => 'fake-name-1',
+                    'version' => 'fake-version-1'
+                  }
+                ]
+              end
+
+              it 'sets a next release version' do
+                expect(job).to receive(:create_package)
+                expect(job).to receive(:register_package)
+                job.perform
+
+                rv = Models::ReleaseVersion.filter(version: '42+dev.7').first
+                expect(rv).to_not be_nil
+              end
+            end
+
+            context 'when there are no job and package changes' do
+              it 'raises an error' do
+                expect {
+                  job.perform
+                }.to raise_error(
+                  Bosh::Director::DirectorError,
+                  /Rebase is attempted without any job or package changes/
+                )
+              end
+            end
+          end
+        end
+
+        context 'when the release version does not match database valid format' do
+          before do
+            # We only want to verify that the proper error is raised
+            # If version can not be validated because it has wrong model format
+            # Currently SemiSemantic Version validates version that matches the model format
+            stub_const("Bosh::Director::Models::VALID_ID", /^[a-z0-9]+$/i)
+          end
+
+          let(:release_version) { 'bad-version' }
+
+          it 'raises an error ReleaseVersionInvalid' do
+            expect {
+              job.perform
+            }.to raise_error(
+              ReleaseVersionInvalid,
+              %Q{Release version invalid `appcloud/#{release_version}'}
+            )
+          end
+        end
+
+        it 'saves release version' do
+          job.perform
+
+          rv = Models::ReleaseVersion.filter(version: '42+dev.6').first
+          expect(rv).to_not be_nil
+        end
+
+        it 'resolves package dependencies' do
+          expect(job).to receive(:resolve_package_dependencies)
+          job.perform
+        end
+
+        context 'when there are packages in manifest' do
+          let(:manifest_packages) do
+            [
+              {
+                'sha1' => 'fake-sha-1',
+                'fingerprint' => 'fake-fingerprint-1',
+                'name' => 'fake-name-1',
+                'version' => 'fake-version-1'
+              },
+              {
+                'sha1' => 'fake-sha-2',
+                'fingerprint' => 'fake-fingerprint-2',
+                'name' => 'fake-name-2',
+                'version' => 'fake-version-2'
+              }
+            ]
+          end
+
+          before do
+            Models::Package.make(release: release, name: 'fake-name-1', version: 'fake-version-1', fingerprint: 'fake-fingerprint-1')
+          end
+
+          it "creates packages that don't already exist" do
+            expect(job).to receive(:create_packages).with([
+              {
+                'sha1' => 'fake-sha-2',
+                'fingerprint' => 'fake-fingerprint-2',
+                'name' => 'fake-name-2',
+                'version' => 'fake-version-2',
+                'dependencies' => []
+              }
+            ])
+            job.perform
+          end
+        end
+
+        context 'when there are jobs in manifest' do
+          let(:manifest_jobs) do
+            [
+              {
+                'sha1' => 'fake-sha-1',
+                'fingerprint' => 'fake-fingerprint-1',
+                'name' => 'fake-name-1',
+                'version' => 'fake-version-1',
+                'templates' => {}
+              },
+              {
+                'sha1' => 'fake-sha-2',
+                'fingerprint' => 'fake-fingerprint-2',
+                'name' => 'fake-name-2',
+                'version' => 'fake-version-2',
+                'templates' => {}
+              }
+            ]
+          end
+
+          before do
+            Models::Template.make(
+              release: release,
+              name: 'fake-name-1',
+              version: 'fake-version-1',
+              fingerprint: 'fake-fingerprint-1'
+            )
+          end
+
+          it "creates jobs that don't already exist" do
+            expect(job).to receive(:create_jobs).with([
+              {
+                'sha1' => 'fake-sha-2',
+                'fingerprint' => 'fake-fingerprint-2',
+                'name' => 'fake-name-2',
+                'version' => 'fake-version-2',
+                'templates' => {}
+              }
+            ])
+            job.perform
+          end
+        end
+
+        describe 'event_log' do
+          it 'prints that release was created' do
+            allow(Config.event_log).to receive(:begin_stage).and_call_original
+            expect(Config.event_log).to receive(:begin_stage).with('Release has been created', 1)
+            job.perform
+          end
+
+          it 'prints name and version' do
+            allow(Config.event_log).to receive(:track).and_call_original
+            expect(Config.event_log).to receive(:track).with('appcloud/42+dev.6')
+            job.perform
+          end
+        end
+      end
     end
 
     describe 'rebasing release' do
-      before(:each) do
-        @manifest = {
+      let(:manifest) do
+        {
           'name' => 'appcloud',
           'version' => '42.6-dev',
           'jobs' => [
@@ -115,21 +305,21 @@ module Bosh::Director
                 'config/zb.yml.erb' => 'config/zb.yml'
               },
               'packages' => %w(foo bar),
-              'fingerprint' => 'deadbeef'
+              'fingerprint' => 'job-fingerprint-1'
             },
             {
               'name' => 'zaz',
               'version' => '0.2-dev',
               'templates' => {},
               'packages' => %w(bar),
-              'fingerprint' => 'badcafe'
+              'fingerprint' => 'job-fingerprint-2'
             },
             {
               'name' => 'zbz',
               'version' => '666',
               'templates' => {},
               'packages' => %w(zbb),
-              'fingerprint' => 'baddead'
+              'fingerprint' => 'job-fingerprint-3'
             }
           ],
           'packages' => [
@@ -137,24 +327,29 @@ module Bosh::Director
               'name' => 'foo',
               'version' => '2.33-dev',
               'dependencies' => %w(bar),
-              'fingerprint' => 'deadbeef'
+              'fingerprint' => 'package-fingerprint-1',
+              'sha1' => 'package-sha1-1'
             },
             {
               'name' => 'bar',
               'version' => '3.14-dev',
               'dependencies' => [],
-              'fingerprint' => 'badcafe'
+              'fingerprint' => 'package-fingerprint-2',
+              'sha1' => 'package-sha1-2'
             },
             {
               'name' => 'zbb',
               'version' => '333',
               'dependencies' => [],
-              'fingerprint' => 'deadbad'
+              'fingerprint' => 'package-fingerprint-3',
+              'sha1' => 'package-sha1-3'
             }
           ]
         }
+      end
 
-        @release_dir = Test::ReleaseHelper.new.create_release_tarball(@manifest)
+      before do
+        @release_dir = Test::ReleaseHelper.new.create_release_tarball(manifest)
 
         @job = Jobs::UpdateRelease.new(@release_dir, 'rebase' => true)
 
@@ -163,81 +358,191 @@ module Bosh::Director
 
         Models::Package.make(release: @release, name: 'foo', version: '2.7-dev')
         Models::Package.make(release: @release, name: 'bar', version: '42')
-        Models::Package.make(release: @release, name: 'zbb', version: '25', fingerprint: 'deadbad')
 
         Models::Template.make(release: @release, name: 'baz', version: '33.7-dev')
         Models::Template.make(release: @release, name: 'zaz', version: '17')
-        Models::Template.make(release: @release, name: 'zbz', version: '28', fingerprint: 'baddead')
+
+        # create up to 6 new blobs (3*job + 3*package)
+        allow(blobstore).to receive(:create).at_most(6).and_return('b1', 'b2', 'b3', 'b4', 'b5', 'b6')
+        # get is only called when a blob is copied
+        allow(blobstore).to receive(:get)
+        allow(@job).to receive(:with_release_lock).with('appcloud').and_yield
       end
 
-      it 'rebases original versions saving the major version' do
-        blobstore.should_receive(:create).
-          exactly(4).times.and_return('b1', 'b2', 'b3', 'b4')
-        @job.should_receive(:with_release_lock).with('appcloud').and_yield
+      it 'rebases the release version' do
         @job.perform
 
-        foos = Models::Package.filter(release_id: @release.id, name: 'foo').all
-        bars = Models::Package.filter(release_id: @release.id, name: 'bar').all
-        zbbs = Models::Package.filter(release_id: @release.id, name: 'zbb').all
+        # No previous release exists with the same release version (42).
+        # So the default dev post-release version is used (semi-semantic format).
+        rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42+dev.1').first
 
-        foos.map { |foo| foo.version }.should =~ %w(2.7-dev 2.8-dev)
-        bars.map { |bar| bar.version }.should =~ %w(42 3.1-dev)
-        zbbs.map { |zbb| zbb.version }.should =~ %w(25) # fingerprint match
-
-        bazs = Models::Template.filter(release_id: @release.id, name: 'baz').all
-        zazs = Models::Template.filter(release_id: @release.id, name: 'zaz').all
-        zbzs = Models::Template.filter(release_id: @release.id, name: 'zbz').all
-
-        bazs.map { |baz| baz.version }.should =~ %w(33 33.7-dev)
-        zazs.map { |zaz| zaz.version }.should =~ %w(17 0.1-dev)
-        zbzs.map { |zbz| zbz.version }.should =~ %w(28) # fingerprint match
-
-        rv = Models::ReleaseVersion.filter(
-          release_id: @release.id, version: '42.1-dev').first
-
-        rv.should_not be_nil
-
-        rv.packages.map { |package| package.version }.should =~ %w(2.8-dev 3.1-dev 25)
-
-        rv.templates.map { |template| template.version }.should =~ %w(33 0.1-dev 28)
+        expect(rv).to_not be_nil
       end
 
-      it 'uses major.1-dev version for initial rebase if no version exists' do
-        blobstore.should_receive(:create).
-          exactly(6).times.and_return('b1', 'b2', 'b3', 'b4', 'b5', 'b6')
+      context 'when the package fingerprint matches one in the database' do
+        before do
+          Models::Package.make(
+            release: @release,
+            name: 'zbb',
+            version: '25',
+            fingerprint: 'package-fingerprint-3',
+            sha1: 'package-sha1-old',
+          )
+        end
 
+        it 'creates new package (version) with copied blob (sha1)' do
+          expect(blobstore).to receive(:create).exactly(6).times # creates new blobs for each package & job
+          expect(blobstore).to receive(:get).exactly(1).times # copies the existing 'zbb' package
+          @job.perform
+
+          zbbs = Models::Package.filter(release_id: @release.id, name: 'zbb').all
+          zbbs.map(&:version).should =~ %w(25 333)
+
+          # Fingerprints are the same because package contents did not change
+          zbbs.map(&:fingerprint).should =~ %w(package-fingerprint-3 package-fingerprint-3)
+
+          # SHA1s are the same because first blob was copied
+          zbbs.map(&:sha1).should =~ %w(package-sha1-old package-sha1-old)
+        end
+
+        it 'associates newly created packages to the release version' do
+          @job.perform
+
+          rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42+dev.1').first
+          rv.packages.map(&:version).should =~ %w(2.33-dev 3.14-dev 333)
+          rv.packages.map(&:fingerprint).should =~ %w(package-fingerprint-1 package-fingerprint-2 package-fingerprint-3)
+          rv.packages.map(&:sha1).should =~ %w(package-sha1-1 package-sha1-2 package-sha1-old)
+        end
+      end
+
+      context 'when the package fingerprint matches multiple in the database' do
+        before do
+          Models::Package.make(release: @release, name: 'zbb', version: '25', fingerprint: 'package-fingerprint-3', sha1: 'package-sha1-25')
+          Models::Package.make(release: @release, name: 'zbb', version: '26', fingerprint: 'package-fingerprint-3', sha1: 'package-sha1-26')
+        end
+
+        it 'creates new package (version) with copied blob (sha1)' do
+          expect(blobstore).to receive(:create).exactly(6).times # creates new blobs for each package & job
+          expect(blobstore).to receive(:get).exactly(1).times # copies the existing 'zbb' package
+          @job.perform
+
+          zbbs = Models::Package.filter(release_id: @release.id, name: 'zbb').all
+          zbbs.map(&:version).should =~ %w(26 25 333)
+
+          # Fingerprints are the same because package contents did not change
+          zbbs.map(&:fingerprint).should =~ %w(package-fingerprint-3 package-fingerprint-3 package-fingerprint-3)
+
+          # SHA1s are the same because first blob was copied
+          zbbs.map(&:sha1).should =~ %w(package-sha1-25 package-sha1-25 package-sha1-26)
+        end
+
+        it 'associates newly created packages to the release version' do
+          @job.perform
+
+          rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42+dev.1').first
+          rv.packages.map(&:version).should =~ %w(2.33-dev 3.14-dev 333)
+          rv.packages.map(&:fingerprint).should =~ %w(package-fingerprint-1 package-fingerprint-2 package-fingerprint-3)
+          rv.packages.map(&:sha1).should =~ %w(package-sha1-1 package-sha1-2 package-sha1-25)
+        end
+      end
+
+      context 'when the package fingerprint is new' do
+        before do
+          Models::Package.make(release: @release, name: 'zbb', version: '25', fingerprint: 'package-fingerprint-old', sha1: 'package-sha1-25')
+        end
+
+        it 'creates new package (version) with new blob (sha1)' do
+          expect(blobstore).to receive(:create).exactly(6).times # creates new blobs for each package & job
+          expect(blobstore).to receive(:get).exactly(0).times # does not copy any existing packages or jobs
+          @job.perform
+
+          zbbs = Models::Package.filter(release_id: @release.id, name: 'zbb').all
+          zbbs.map(&:version).should =~ %w(25 333)
+
+          # Fingerprints are different because package contents are different
+          zbbs.map(&:fingerprint).should =~ %w(package-fingerprint-old package-fingerprint-3)
+
+          # SHA1s are different because package tars are different
+          zbbs.map(&:sha1).should =~ %w(package-sha1-25 package-sha1-3)
+        end
+
+        it 'associates newly created packages to the release version' do
+          @job.perform
+
+          rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42+dev.1').first
+          rv.packages.map(&:version).should =~ %w(2.33-dev 3.14-dev 333)
+          rv.packages.map(&:fingerprint).should =~ %w(package-fingerprint-1 package-fingerprint-2 package-fingerprint-3)
+          rv.packages.map(&:sha1).should =~ %w(package-sha1-1 package-sha1-2 package-sha1-3)
+        end
+      end
+
+      context 'when the job fingerprint matches one in the database' do
+        before do
+          Models::Template.make(release: @release, name: 'zbz', version: '28', fingerprint: 'job-fingerprint-3')
+        end
+
+        it 'uses the new job blob' do
+          expect(blobstore).to receive(:create).exactly(6).times # creates new blobs for each package & job
+          expect(blobstore).to receive(:get).exactly(0).times # does not copy any existing packages or jobs
+          @job.perform
+
+          zbzs = Models::Template.filter(release_id: @release.id, name: 'zbz').all
+          zbzs.map(&:version).should =~ %w(28 666)
+          zbzs.map(&:fingerprint).should =~ %w(job-fingerprint-3 job-fingerprint-3)
+
+          rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42+dev.1').first
+          rv.templates.map(&:fingerprint).should =~ %w(job-fingerprint-1 job-fingerprint-2 job-fingerprint-3)
+        end
+      end
+
+      context 'when the job fingerprint is new' do
+        before do
+          Models::Template.make(release: @release, name: 'zbz', version: '28', fingerprint: 'job-fingerprint-old')
+        end
+
+        it 'uses the new job blob' do
+          expect(blobstore).to receive(:create).exactly(6).times # creates new blobs for each package & job
+          expect(blobstore).to receive(:get).exactly(0).times # does not copy any existing packages or jobs
+          @job.perform
+
+          zbzs = Models::Template.filter(release_id: @release.id, name: 'zbz').all
+          zbzs.map(&:version).should =~ %w(28 666)
+          zbzs.map(&:fingerprint).should =~ %w(job-fingerprint-old job-fingerprint-3)
+
+          rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42+dev.1').first
+          rv.templates.map(&:fingerprint).should =~ %w(job-fingerprint-1 job-fingerprint-2 job-fingerprint-3)
+        end
+      end
+
+      it 'uses major+dev.1 version for initial rebase if no version exists' do
         @rv.destroy
         Models::Package.each { |p| p.destroy }
         Models::Template.each { |t| t.destroy }
 
-        @job.should_receive(:with_release_lock).with('appcloud').and_yield
         @job.perform
 
         foos = Models::Package.filter(release_id: @release.id, name: 'foo').all
         bars = Models::Package.filter(release_id: @release.id, name: 'bar').all
 
-        foos.map { |foo| foo.version }.should =~ %w(2.1-dev)
-        bars.map { |bar| bar.version }.should =~ %w(3.1-dev)
+        foos.map { |foo| foo.version }.should =~ %w(2.33-dev)
+        bars.map { |bar| bar.version }.should =~ %w(3.14-dev)
 
         bazs = Models::Template.filter(release_id: @release.id, name: 'baz').all
         zazs = Models::Template.filter(release_id: @release.id, name: 'zaz').all
 
         bazs.map { |baz| baz.version }.should =~ %w(33)
-        zazs.map { |zaz| zaz.version }.should =~ %w(0.1-dev)
+        zazs.map { |zaz| zaz.version }.should =~ %w(0.2-dev)
 
-        rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42.1-dev').first
+        rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42+dev.1').first
 
-        rv.packages.map { |p| p.version }.should =~ %w(2.1-dev 3.1-dev 333)
-        rv.templates.map { |t| t.version }.should =~ %w(33 0.1-dev 666)
+        rv.packages.map { |p| p.version }.should =~ %w(2.33-dev 3.14-dev 333)
+        rv.templates.map { |t| t.version }.should =~ %w(0.2-dev 33 666)
       end
 
       it 'performs no rebase if same release is being rebased twice' do
         dup_release_dir = Dir.mktmpdir
         FileUtils.cp(File.join(@release_dir, 'release.tgz'), dup_release_dir)
 
-        blobstore.should_receive(:create).
-          exactly(4).times.and_return('b1', 'b2', 'b3', 'b4')
-        @job.should_receive(:with_release_lock).with('appcloud').and_yield
         @job.perform
 
         job = Jobs::UpdateRelease.new(dup_release_dir, 'rebase' => true)
@@ -246,43 +551,6 @@ module Bosh::Director
         expect {
           job.perform
         }.to raise_error(/Rebase is attempted without any job or package change/)
-      end
-
-      it 'prefers the same name/version, then final version, ' +
-           'then version with most compiled packages' +
-           "when there's more than one match" do
-        Models::Package.each { |p| p.destroy }
-        Models::Template.each { |t| t.destroy }
-
-        Models::Package.make(release: @release, name: 'bar', version: '3.14-dev', fingerprint: 'badcafe')
-
-        Models::Package.make(release: @release, name: 'bar', version: '52', fingerprint: 'badcafe')
-
-        zbb1 = Models::Package.make(release: @release, name: 'zbb', version: '22.1-dev', fingerprint: 'deadbad')
-
-        zbb2 = Models::Package.make(release: @release, name: 'zbb', version: '22.2-dev', fingerprint: 'deadbad')
-
-        Models::CompiledPackage.make(package: zbb1)
-        2.times do
-          Models::CompiledPackage.make(package: zbb2)
-        end
-
-        Models::Template.make(release: @release, name: 'baz', version: '332.1-dev', fingerprint: 'deadbeef')
-
-        Models::Template.make(release: @release, name: 'baz', version: '333', fingerprint: 'deadbeef')
-
-        blobstore.should_receive(:create).
-          exactly(3).times.and_return('b1', 'b2', 'b3')
-        @job.should_receive(:with_release_lock).with('appcloud').and_yield
-        @job.perform
-
-        rv = Models::ReleaseVersion.filter(release_id: @release.id, version: '42.1-dev').first
-
-        rv.packages.select { |p| p.name == 'bar' }.map { |p| p.version }.should =~ %w(3.14-dev)
-
-        rv.packages.select { |p| p.name == 'zbb' }.map { |p| p.version }.should =~ %w(22.2-dev)
-
-        rv.templates.select { |t| t.name == 'baz' }.map { |t| t.version }.should =~ %w(333)
       end
     end
 
@@ -415,7 +683,6 @@ module Bosh::Director
       end
     end
 
-
     describe 'create jobs' do
       before do
         @release = Models::Release.make
@@ -433,7 +700,7 @@ module Bosh::Director
       it 'should create a proper template and upload job bits to blobstore' do
         File.open(@tarball, 'w') { |f| f.write(@job_bits) }
 
-        blobstore.should_receive(:create).and_return do |f|
+        blobstore.should_receive(:create) do |f|
           f.rewind
           Digest::SHA1.hexdigest(f.read).should == Digest::SHA1.hexdigest(@job_bits)
 

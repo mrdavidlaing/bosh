@@ -1,6 +1,6 @@
 # Copyright (c) 2009-2012 VMware, Inc.
 
-require 'common/version_number'
+require 'common/version/release_version'
 
 module Bosh::Director
   module Jobs
@@ -25,8 +25,6 @@ module Bosh::Director
         @release_version_model = nil
 
         @rebase = !!options["rebase"]
-        @package_rebase_mapping = {}
-        @job_rebase_mapping = {}
 
         @manifest = nil
         @name = nil
@@ -34,9 +32,9 @@ module Bosh::Director
 
         @packages_unchanged = false
         @jobs_unchanged = false
-        
+
         @remote_release = options['remote'] || false
-        @remote_release_location = options['location'] if @remote_release 
+        @remote_release_location = options['location'] if @remote_release
       end
 
       # Extracts release tarball, verifies release manifest and saves release
@@ -69,7 +67,7 @@ module Bosh::Director
         end
       end
 
-      def download_remote_release         
+      def download_remote_release
         release_file = File.join(@tmp_release_dir, Api::ReleaseManager::RELEASE_TGZ)
         download_remote_file('release', @remote_release_location, release_file)
       end
@@ -104,7 +102,16 @@ module Bosh::Director
         normalize_manifest
 
         @name = @manifest["name"]
-        @version = @manifest["version"]
+
+        begin
+          @version = Bosh::Common::Version::ReleaseVersion.parse(@manifest["version"])
+          unless @version == @manifest["version"]
+            logger.info("Formatted version '#{@manifest["version"]}' => '#{@version}'")
+          end
+        rescue SemiSemantic::ParseError
+          raise ReleaseVersionInvalid, "Release version invalid: #{@manifest["version"]}"
+        end
+
         @commit_hash = @manifest.fetch("commit_hash", nil)
         @uncommitted_changes = @manifest.fetch("uncommitted_changes", nil)
       end
@@ -113,21 +120,27 @@ module Bosh::Director
       # @return [void]
       def process_release
         @release_model = Models::Release.find_or_create(:name => @name)
+
         if @rebase
           @version = next_release_version
         end
 
         version_attrs = {
           :release => @release_model,
-          :version => @version
+          :version => @version.to_s
         }
         version_attrs[:uncommitted_changes] = @uncommitted_changes if @uncommitted_changes
         version_attrs[:commit_hash] = @commit_hash if @commit_hash
 
         @release_version_model = Models::ReleaseVersion.new(version_attrs)
         unless @release_version_model.valid?
-          raise ReleaseAlreadyExists,
-                "Release `#{@name}/#{@version}' already exists"
+          if @release_version_model.errors[:version] == [:format]
+            raise ReleaseVersionInvalid,
+              "Release version invalid `#{@name}/#{@version}'"
+          else
+            raise ReleaseAlreadyExists,
+              "Release `#{@name}/#{@version}' already exists"
+          end
         end
 
         @release_version_model.save
@@ -140,28 +153,11 @@ module Bosh::Director
         process_packages
         process_jobs
 
-        unless @package_rebase_mapping.empty?
-          event_log.begin_stage(
-            "Rebased packages", @package_rebase_mapping.size)
-          @package_rebase_mapping.each_pair do |name, transition|
-            event_log.track("#{name}: #{transition}") {}
-          end
-        end
-
-        unless @job_rebase_mapping.empty?
-          event_log.begin_stage(
-            "Rebased jobs", @job_rebase_mapping.size)
-          @job_rebase_mapping.each_pair do |name, transition|
-            event_log.track("#{name}: #{transition}") {}
-          end
-        end
-
         event_log.begin_stage("Release has been created", 1)
         event_log.track("#{@name}/#{@version}") {}
       end
 
-      # Normalizes release manifest, so all names, versions, and checksums
-      # are Strings.
+      # Normalizes release manifest, so all names, versions, and checksums are Strings.
       # @return [void]
       def normalize_manifest
         Bosh::Director.hash_string_vals(@manifest, 'name', 'version')
@@ -209,49 +205,18 @@ module Bosh::Director
         existing_packages = []
 
         @manifest["packages"].each do |package_meta|
-          filter = {:sha1 => package_meta["sha1"]}
-          if package_meta["fingerprint"]
-            filter[:fingerprint] = package_meta["fingerprint"]
-            filter = filter.sql_or
-          end
-
           # Checking whether we might have the same bits somewhere
-          packages = Models::Package.where(filter).all
+          packages = Models::Package.where(fingerprint: package_meta["fingerprint"]).all
 
           if packages.empty?
             new_packages << package_meta
             next
           end
 
-          # Rebase is an interesting use case: we don't really care about
-          # preserving the original package/job versions, so if we have a
-          # checksum/fingerprint match, we can just substitute the original
-          # package/job version with an existing one.
-          if @rebase
-            substitutes = packages.select do |package|
-              package.release_id == @release_model.id &&
-              package.name == package_meta["name"] &&
-              package.dependency_set == Set.new(package_meta["dependencies"])
-            end
-
-            substitute = pick_best(substitutes, package_meta["version"])
-
-            if substitute
-              package_meta["version"] = substitute.version
-              package_meta["sha1"] = substitute.sha1
-              existing_packages << [substitute, package_meta]
-              next
-            end
-          end
-
-          # We can reuse an existing package as long as it
-          # belongs to the same release and has the same name and version.
           existing_package = packages.find do |package|
             package.release_id == @release_model.id &&
             package.name == package_meta["name"] &&
             package.version == package_meta["version"]
-            # NOT checking dependencies here b/c dependency change would
-            # bump the package version anyway.
           end
 
           if existing_package
@@ -262,6 +227,7 @@ module Bosh::Director
             # of the package blob and create a new db entry for it
             package = packages.first
             package_meta["blobstore_id"] = package.blobstore_id
+            package_meta["sha1"] = package.sha1
             new_packages << package_meta
           end
         end
@@ -295,25 +261,10 @@ module Bosh::Director
       def use_existing_packages(packages)
         return if packages.empty?
 
-        n_packages = packages.size
-        event_log.begin_stage("Processing #{n_packages} existing " +
-                              "package#{n_packages > 1 ? "s" : ""}", 1)
-
-        event_log.track("Verifying checksums") do
-          packages.each do |package, package_meta|
+        single_step_stage("Processing #{packages.size} existing package#{"s" if packages.size > 1}") do
+          packages.each do |package, _|
             package_desc = "#{package.name}/#{package.version}"
-            logger.info("Package `#{package_desc}' already exists, " +
-                        "verifying checksum")
-
-            expected = package.sha1
-            received = package_meta["sha1"]
-
-            if expected != received
-              raise ReleaseExistingPackageHashMismatch,
-                    "`#{package_desc}' checksum mismatch, " +
-                      "expected #{expected} but received #{received}"
-            end
-            logger.info("Package `#{package_desc}' verified")
+            logger.info("Using existing package `#{package_desc}'")
             register_package(package)
           end
         end
@@ -332,17 +283,6 @@ module Bosh::Director
           :fingerprint => package_meta["fingerprint"],
           :version => version
         }
-
-        if @rebase
-          new_version = next_package_version(name, version)
-          if new_version != version
-            transition = "#{version} -> #{new_version}"
-            logger.info("Package `#{name}' rebased: #{transition}")
-            package_attrs[:version] = new_version
-            version = new_version
-            @package_rebase_mapping[name] = transition
-          end
-        end
 
         package = Models::Package.new(package_attrs)
         package.dependency_set = package_meta["dependencies"]
@@ -381,8 +321,7 @@ module Bosh::Director
 
       # Finds job template definitions in release manifest and sorts them into
       # two buckets: new and existing job templates, then creates new job
-      # template records in the database and points release version to existing
-      # ones.
+      # template records in the database and points release version to existing ones.
       # @return [void]
       def process_jobs
         logger.info("Checking for new jobs in release")
@@ -391,33 +330,8 @@ module Bosh::Director
         existing_jobs = []
 
         @manifest["jobs"].each do |job_meta|
-          filter = {:sha1 => job_meta["sha1"]}
-          if job_meta["fingerprint"]
-            filter[:fingerprint] = job_meta["fingerprint"]
-            filter = filter.sql_or
-          end
-
           # Checking whether we might have the same bits somewhere
-          jobs = Models::Template.where(filter).all
-
-          if @rebase
-            substitutes = jobs.select do |job|
-              job.release_id == @release_model.id &&
-              job.name == job_meta["name"]
-            end
-
-            substitute = pick_best(substitutes, job_meta["version"])
-
-            if substitute
-              job_meta["version"] = substitute.version
-              job_meta["sha1"] = substitute.sha1
-              existing_jobs << [substitute, job_meta]
-            else
-              new_jobs << job_meta
-            end
-
-            next
-          end
+          jobs = Models::Template.where(fingerprint: job_meta["fingerprint"]).all
 
           template = jobs.find do |job|
             job.release_id == @release_model.id &&
@@ -464,17 +378,6 @@ module Bosh::Director
           :version => version
         }
 
-        if @rebase
-          new_version = next_template_version(name, version)
-          if new_version != version
-            transition = "#{version} -> #{new_version}"
-            logger.info("Job `#{name}' rebased: #{transition}")
-            template_attrs[:version] = new_version
-            version = new_version
-            @job_rebase_mapping[name] = transition
-          end
-        end
-
         logger.info("Creating job template `#{name}/#{version}' " +
                     "from provided bits")
         template = Models::Template.new(template_attrs)
@@ -506,8 +409,7 @@ module Bosh::Director
             path = File.join(job_dir, "templates", relative_path)
             unless File.file?(path)
               raise JobMissingTemplateFile,
-                    "Missing template file `#{relative_path}' " +
-                    "for job `#{template.name}'"
+                    "Missing template file `#{relative_path}' for job `#{template.name}'"
             end
           end
         end
@@ -559,27 +461,10 @@ module Bosh::Director
       def use_existing_jobs(jobs)
         return if jobs.empty?
 
-        n_jobs = jobs.size
-        event_log.begin_stage("Processing #{n_jobs} existing " +
-                              "job#{n_jobs > 1 ? "s" : ""}", 1)
-
-        event_log.track("Verifying checksums") do
-          jobs.each do |template, job_meta|
+        single_step_stage("Processing #{jobs.size} existing job#{"s" if jobs.size > 1}") do
+          jobs.each do |template, _|
             job_desc = "#{template.name}/#{template.version}"
-
-            logger.info("Job `#{job_desc}' already exists, " +
-                        "verifying checksum")
-
-            expected = template.sha1
-            received = job_meta["sha1"]
-
-            if expected != received
-              raise ReleaseExistingJobHashMismatch,
-                    "`#{job_desc}' checksum mismatch, " +
-                    "expected #{expected} but received #{received}"
-            end
-
-            logger.info("Job `#{job_desc}' verified")
+            logger.info("Using existing job `#{job_desc}'")
             register_template(template)
           end
         end
@@ -597,45 +482,11 @@ module Bosh::Director
       # Returns the next release version (to be used for rebased release)
       # @return [String]
       def next_release_version
-        attrs = {
-          :release_id => @release_model.id
-        }
-        next_version(Models::ReleaseVersion.filter(attrs).all, @version)
-      end
-
-      # Returns the next package version (to be used for rebased package)
-      # @param [String] name Package name
-      # @param [String] version Package version
-      # @return [String]
-      def next_package_version(name, version)
-        attrs = {
-          :release_id => @release_model.id,
-          :name => name
-        }
-
-        next_version(Models::Package.filter(attrs).all, version)
-      end
-
-      # Returns the next job template version (to be used for rebased template)
-      # @param [String] name Template name
-      # @param [Fixnum] version Template version
-      # @return [String]
-      def next_template_version(name, version)
-        attrs = {
-          :release_id => @release_model.id,
-          :name => name
-        }
-
-        next_version(Models::Template.filter(attrs).all, version)
-      end
-
-      # Takes collection of versioned items and returns the version
-      # that new item should be promoted to if auto-versioning is used
-      # @param [Array<#version>] Collection of items
-      # @param [String] version Current version of item
-      # @return [String] Next version to be used
-      def next_version(collection, version)
-        Bosh::Director::NextRebaseVersion.new(collection).calculate(version)
+        attrs = {:release_id => @release_model.id}
+        models = Models::ReleaseVersion.filter(attrs).all
+        strings = models.map(&:version)
+        list = Bosh::Common::Version::ReleaseVersionList.parse(strings)
+        list.rebase(@version)
       end
 
       # Removes release version model, along with all packages and templates.
@@ -646,26 +497,6 @@ module Bosh::Director
         @release_version_model.remove_all_packages
         @release_version_model.remove_all_templates
         @release_version_model.destroy
-      end
-
-      # Picks the best matching package/job from collection based on a simple
-      # heuristics: items with same version are preferred, then items
-      # with non-dev versions, then items with most compiled packages,
-      # then everything else.
-      # @param [Array<#name,#version>] collection
-      # @param [String] original_version
-      def pick_best(collection, original_version)
-        collection.sort_by { |item|
-          if item.version == original_version
-            1
-          elsif Bosh::Common::VersionNumber.new(item.version).final?
-            2
-          elsif item.is_a?(Bosh::Director::Models::Package)
-            3000 - [item.compiled_packages.size, 900].min
-          else
-            3000
-          end
-        }.first
       end
     end
   end

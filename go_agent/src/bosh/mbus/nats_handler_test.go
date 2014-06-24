@@ -12,25 +12,29 @@ import (
 	boshhandler "bosh/handler"
 	boshlog "bosh/logger"
 	. "bosh/mbus"
+	boshsettings "bosh/settings"
 	fakesettings "bosh/settings/fakes"
 )
 
 func init() {
 	Describe("natsHandler", func() {
 		var (
-			client  *fakeyagnats.FakeYagnats
-			logger  boshlog.Logger
-			handler boshhandler.Handler
+			settingsService *fakesettings.FakeSettingsService
+			client          *fakeyagnats.FakeYagnats
+			logger          boshlog.Logger
+			handler         boshhandler.Handler
 		)
 
 		BeforeEach(func() {
-			settings := &fakesettings.FakeSettingsService{
-				AgentID: "my-agent-id",
-				MbusURL: "nats://fake-username:fake-password@127.0.0.1:1234",
+			settingsService = &fakesettings.FakeSettingsService{
+				Settings: boshsettings.Settings{
+					AgentID: "my-agent-id",
+					Mbus:    "nats://fake-username:fake-password@127.0.0.1:1234",
+				},
 			}
 			logger = boshlog.NewLogger(boshlog.LevelNone)
 			client = fakeyagnats.New()
-			handler = NewNatsHandler(settings, logger, client)
+			handler = NewNatsHandler(settingsService, client, logger)
 		})
 
 		Describe("Start", func() {
@@ -123,7 +127,7 @@ func init() {
 				Expect(len(messages)).To(Equal(2))
 				Expect(messages[0].Payload).To(MatchRegexp("value"))
 				Expect(messages[1].Payload).To(Equal([]byte(
-					`{"exception":{"message":"Response exceeded maximum size allowed to be sent over NATS"}}`)))
+					`{"exception":{"message":"Response exceeded maximum allowed length"}}`)))
 			})
 
 			It("can add additional handler funcs to receive requests", func() {
@@ -182,8 +186,8 @@ func init() {
 			})
 
 			It("does not err when no username and password", func() {
-				settings := &fakesettings.FakeSettingsService{MbusURL: "nats://127.0.0.1:1234"}
-				handler = NewNatsHandler(settings, logger, client)
+				settingsService.Settings.Mbus = "nats://127.0.0.1:1234"
+				handler = NewNatsHandler(settingsService, client, logger)
 
 				err := handler.Start(func(req boshhandler.Request) (res boshhandler.Response) { return })
 				Expect(err).ToNot(HaveOccurred())
@@ -191,8 +195,8 @@ func init() {
 			})
 
 			It("errs when has username without password", func() {
-				settings := &fakesettings.FakeSettingsService{MbusURL: "nats://foo@127.0.0.1:1234"}
-				handler = NewNatsHandler(settings, logger, client)
+				settingsService.Settings.Mbus = "nats://foo@127.0.0.1:1234"
+				handler = NewNatsHandler(settingsService, client, logger)
 
 				err := handler.Start(func(req boshhandler.Request) (res boshhandler.Response) { return })
 				Expect(err).To(HaveOccurred())

@@ -36,25 +36,28 @@ namespace :spec do
       trap('INT') { exit }
 
       builds = Dir['*'].select { |f| File.directory?(f) && File.exists?("#{f}/spec") }
-      builds -= ['bat']
+      builds -= %w(bat)
 
-      cpi_builds = Dir['*'].select { |f| File.directory?(f) && f.end_with?("_cpi") }
+      cpi_builds = builds.select { |f| File.directory?(f) && f.end_with?("_cpi") }
 
       spec_logs = Dir.mktmpdir
 
       puts "Logging spec results in #{spec_logs}"
 
-      Bosh::ThreadPool.new(max_threads: 10, logger: Logger.new('/dev/null')).wrap do |pool|
+      max_threads = ENV.fetch('BOSH_MAX_THREADS', 10).to_i
+      Bosh::ThreadPool.new(max_threads: max_threads, logger: Logger.new('/dev/null')).wrap do |pool|
         builds.each do |build|
-          puts "-----Building #{build}-----"
-
           pool.process do
             log_file    = "#{spec_logs}/#{build}.log"
             rspec_files = cpi_builds.include?(build) ? "spec/unit/" : "spec/"
-            rspec_cmd   = "cd #{build} && rspec --tty -c -f p #{rspec_files} > #{log_file} 2>&1"
+            rspec_cmd   = "rspec --tty -c -f p #{rspec_files}"
 
-            if system(rspec_cmd)
+            # inject command name so coverage results for each component don't clobber others
+            if system({'BOSH_BUILD_NAME' => build}, "cd #{build} && #{rspec_cmd} > #{log_file} 2>&1")
+              puts "----- BEGIN #{build}"
+              puts "           #{rspec_cmd}"
               print File.read(log_file)
+              puts "----- END   #{build}\n\n"
             else
               raise("#{build} failed to build unit tests: #{File.read(log_file)}")
             end

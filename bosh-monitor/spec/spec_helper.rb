@@ -64,5 +64,5 @@ def make_heartbeat(attrs = {})
 end
 
 RSpec.configure do |c|
-  c.color_enabled = true
+  c.color = true
 end

@@ -130,7 +130,7 @@ func (p linux) SetupManualNetworking(networks boshsettings.Networks) (err error)
 }
 
 func (p linux) SetupDhcp(networks boshsettings.Networks) (err error) {
-	return p.netManager.SetupDhcp(networks)
+	return p.netManager.SetupDhcp(networks, nil)
 }
 
 func (p linux) SetupRuntimeConfiguration() (err error) {
@@ -662,6 +662,15 @@ func (p linux) GetMonitCredentials() (username, password string, err error) {
 	username = credParts[0]
 	password = credParts[1]
 	return
+}
+
+func (p linux) PrepareForNetworkingChange() error {
+	err := p.fs.RemoveAll("/etc/udev/rules.d/70-persistent-net.rules")
+	if err != nil {
+		return bosherr.WrapError(err, "Removing network rules file")
+	}
+
+	return nil
 }
 
 func (p linux) GetDefaultNetwork() (boshsettings.Network, error) {

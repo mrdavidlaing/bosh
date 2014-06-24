@@ -54,6 +54,7 @@ func (boot bootstrap) Run() (settingsService boshsettings.Service, err error) {
 		boot.fs,
 		boot.dirProvider.BoshDir(),
 		boot.infrastructure.GetSettings,
+		boot.platform,
 		boot.logger,
 	)
 
@@ -65,7 +66,7 @@ func (boot bootstrap) Run() (settingsService boshsettings.Service, err error) {
 
 	settings := settingsService.GetSettings()
 
-	err = boot.setUserPasswords(settings)
+	err = boot.setUserPasswords(settings.Env)
 	if err != nil {
 		err = bosherr.WrapError(err, "Settings user password")
 		return
@@ -89,11 +90,9 @@ func (boot bootstrap) Run() (settingsService boshsettings.Service, err error) {
 		return
 	}
 
-	disks := settingsService.GetDisks()
-
-	ephemeralDiskPath, found := boot.infrastructure.GetEphemeralDiskPath(disks.Ephemeral)
+	ephemeralDiskPath, found := boot.infrastructure.GetEphemeralDiskPath(settings.Disks.Ephemeral)
 	if !found {
-		err = bosherr.New("Could not find ephemeral disk '%s'", disks.Ephemeral)
+		err = bosherr.New("Could not find ephemeral disk '%s'", settings.Disks.Ephemeral)
 		return
 	}
 
@@ -115,12 +114,12 @@ func (boot bootstrap) Run() (settingsService boshsettings.Service, err error) {
 		return
 	}
 
-	if len(disks.Persistent) > 1 {
+	if len(settings.Disks.Persistent) > 1 {
 		err = errors.New("Error mounting persistent disk, there is more than one persistent disk")
 		return
 	}
 
-	for _, devicePath := range disks.Persistent {
+	for _, devicePath := range settings.Disks.Persistent {
 		err = boot.platform.MountPersistentDisk(devicePath, boot.dirProvider.StoreDir())
 		if err != nil {
 			err = bosherr.WrapError(err, "Mounting persistent disk")
@@ -139,24 +138,25 @@ func (boot bootstrap) Run() (settingsService boshsettings.Service, err error) {
 		err = bosherr.WrapError(err, "Starting monit")
 		return
 	}
+
 	return
 }
 
-func (boot bootstrap) setUserPasswords(settings boshsettings.Settings) (err error) {
-	password := settings.Env.GetPassword()
+func (boot bootstrap) setUserPasswords(env boshsettings.Env) error {
+	password := env.GetPassword()
 	if password == "" {
-		return
+		return nil
 	}
 
-	err = boot.platform.SetUserPassword(boshsettings.RootUsername, settings.Env.GetPassword())
+	err := boot.platform.SetUserPassword(boshsettings.RootUsername, password)
 	if err != nil {
-		err = bosherr.WrapError(err, "Setting root password")
-		return
+		return bosherr.WrapError(err, "Setting root password")
 	}
 
-	err = boot.platform.SetUserPassword(boshsettings.VCAPUsername, settings.Env.GetPassword())
+	err = boot.platform.SetUserPassword(boshsettings.VCAPUsername, password)
 	if err != nil {
-		err = bosherr.WrapError(err, "Setting vcap password")
+		return bosherr.WrapError(err, "Setting vcap password")
 	}
-	return
+
+	return nil
 }
