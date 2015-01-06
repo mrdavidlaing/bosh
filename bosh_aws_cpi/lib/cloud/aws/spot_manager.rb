@@ -12,6 +12,7 @@ module Bosh::AwsCloud
     end
 
     def create(instance_params, spot_bid_price)
+      @instance_params = instance_params
       spot_request_spec = create_spot_request_spec(instance_params, spot_bid_price)
       @logger.debug("Requesting spot instance with: #{spot_request_spec.inspect}")
 
@@ -43,7 +44,9 @@ module Bosh::AwsCloud
             fail_spot_creation("VM spot instance creation failed: #{status.inspect}")
           when 'open'
             if status[:status] != nil && status[:status][:code] == 'price-too-low'
-              fail_spot_creation("Cannot create VM spot instance because bid price is too low: #{status.inspect}")
+              @logger.warn("Cannot create VM spot instance because bid price is too low: #{status.inspect}. Reverting to creating ondemand instance")
+              cancel_pending_spot_requests
+              instance = create_on_demand_instance @instance_params
             end
           when 'active'
             @logger.info("Spot request instances fulfilled: #{status.inspect}")
@@ -54,9 +57,24 @@ module Bosh::AwsCloud
 
       instance
     rescue Bosh::Common::RetryCountExceeded
-      @logger.warn("Timed out waiting for spot request #{@spot_instance_requests.inspect} to be fulfilled")
+      @logger.warn("Timed out waiting for spot request #{@spot_instance_requests.inspect} to be fulfilled. Reverting to creating ondemand instance")
       cancel_pending_spot_requests
-      raise Bosh::Clouds::VMCreationFailed.new(true)
+      create_on_demand_instance @instance_params
+    end
+
+    def create_on_demand_instance(instance_params)
+      aws_instance = nil
+      # Retry the create instance operation a couple of times if we are told that the IP
+      # address is in use - it can happen when the director recreates a VM and AWS
+      # is too slow to update its state when we have released the IP address and want to
+      # realocate it again.
+      errors = [AWS::EC2::Errors::InvalidIPAddress::InUse]
+      Bosh::Common.retryable(sleep: TOTAL_WAIT_TIME_IN_SECONDS/RETRY_COUNT, tries: RETRY_COUNT, on: errors) do |tries, error|
+        @logger.info("Creating on-demand instance using params: #{instance_params.inspect}")
+        @logger.warn("IP address was in use: #{error}") if tries > 0
+        aws_instance = @region.instances.create(instance_params)
+      end
+      aws_instance
     end
 
     def create_spot_request_spec(instance_params, spot_price)
